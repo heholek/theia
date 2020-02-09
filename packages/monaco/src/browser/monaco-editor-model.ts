@@ -75,8 +75,8 @@ export class MonacoEditorModel implements ITextEditorModel, TextEditorDocument {
         this.toDispose.push(this.onDidSaveModelEmitter);
         this.toDispose.push(this.onWillSaveModelEmitter);
         this.toDispose.push(this.onDirtyChangedEmitter);
-        this.resolveModel = resource.readContents(options).then(content => this.initialize(content));
         this.defaultEncoding = options && options.encoding ? options.encoding : undefined;
+        this.resolveModel = this.readContents().then(content => this.initialize(content || ''));
     }
 
     dispose(): void {
@@ -243,8 +243,14 @@ export class MonacoEditorModel implements ITextEditorModel, TextEditorDocument {
             return;
         }
 
-        const newText = await this.readContents();
-        if (newText === undefined || token.isCancellationRequested || this._dirty) {
+        let newText = await this.readContents();
+        if (newText === undefined) {
+            if (this._dirty) {
+                return;
+            }
+            newText = '';
+        }
+        if (token.isCancellationRequested || this._dirty) {
             return;
         }
 

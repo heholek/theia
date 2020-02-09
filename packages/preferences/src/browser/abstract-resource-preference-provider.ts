@@ -15,20 +15,26 @@
  ********************************************************************************/
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable no-null/no-null */
 
 import * as jsoncparser from 'jsonc-parser';
 import { JSONExt } from '@phosphor/coreutils/lib/json';
 import { inject, injectable, postConstruct } from 'inversify';
-import { MessageService, Resource, ResourceProvider, Disposable } from '@theia/core';
+import { ResourceProvider } from '@theia/core/lib/common/resource';
+import { MessageService } from '@theia/core/lib/common/message-service';
+import { Disposable } from '@theia/core/lib/common/disposable';
 import { PreferenceProvider, PreferenceSchemaProvider, PreferenceScope, PreferenceProviderDataChange, PreferenceService } from '@theia/core/lib/browser';
 import URI from '@theia/core/lib/common/uri';
 import { PreferenceConfigurations } from '@theia/core/lib/browser/preferences/preference-configurations';
+import { MonacoTextModelService } from '@theia/monaco/lib/browser/monaco-text-model-service';
+import { MonacoEditorModel } from '@theia/monaco/lib/browser/monaco-editor-model';
+import { MonacoWorkspace } from '@theia/monaco/lib/browser/monaco-workspace';
 
 @injectable()
 export abstract class AbstractResourcePreferenceProvider extends PreferenceProvider {
 
     protected preferences: { [key: string]: any } = {};
-    protected resource: Promise<Resource>;
+    protected reference: Promise<monaco.editor.IReference<MonacoEditorModel>>;
 
     @inject(PreferenceService) protected readonly preferenceService: PreferenceService;
     @inject(ResourceProvider) protected readonly resourceProvider: ResourceProvider;
@@ -38,23 +44,43 @@ export abstract class AbstractResourcePreferenceProvider extends PreferenceProvi
     @inject(PreferenceConfigurations)
     protected readonly configurations: PreferenceConfigurations;
 
+    @inject(MonacoTextModelService)
+    protected readonly textModelService: MonacoTextModelService;
+
+    @inject(MonacoWorkspace)
+    protected readonly workspace: MonacoWorkspace;
+
     @postConstruct()
     protected async init(): Promise<void> {
         const uri = this.getUri();
-        this.resource = this.resourceProvider(uri);
+
+        // it is blocking till the preference service is initialized,
+        // so first try to load from the underlying resource
+        this.reference = this.textModelService.createModelReference(uri);
 
         // Try to read the initial content of the preferences.  The provider
         // becomes ready even if we fail reading the preferences, so we don't
         // hang the preference service.
-        this.readPreferences()
-            .then(() => this._ready.resolve())
-            .catch(() => this._ready.resolve());
-
-        const resource = await this.resource;
-        this.toDispose.push(resource);
-        if (resource.onDidChangeContents) {
-            this.toDispose.push(resource.onDidChangeContents(() => this.readPreferences()));
+        try {
+            const resource = await this.resourceProvider(uri);
+            try {
+                const content = await resource.readContents();
+                this.loadPreferences(content);
+            } finally {
+                resource.dispose();
+            }
+        } catch {
+            /* no-op */
+        } finally {
+            this._ready.resolve();
         }
+
+        const reference = await this.reference;
+        if (this.toDispose.disposed) {
+            reference.dispose();
+        }
+        this.toDispose.push(reference);
+        this.toDispose.push(reference.object.onDidChangeContent(() => this.readPreferences()));
         this.toDispose.push(Disposable.create(() => this.reset()));
     }
 
@@ -94,51 +120,67 @@ export abstract class AbstractResourcePreferenceProvider extends PreferenceProvi
         if (!path) {
             return false;
         }
-        const resource = await this.resource;
-        if (!resource.saveContents) {
-            return false;
-        }
-        const content = ((await this.readContents()) || '').trim();
-        if (!content && value === undefined) {
-            return true;
-        }
         try {
-            let newContent = '';
-            if (path.length || value !== undefined) {
-                const formattingOptions = this.getFormattingOptions(resourceUri);
-                const edits = jsoncparser.modify(content, path, value, { formattingOptions });
-                newContent = jsoncparser.applyEdits(content, edits);
+            const reference = await this.reference;
+            const content = reference.object.getText().trim();
+            if (!content && value === undefined) {
+                return true;
             }
-            await resource.saveContents(newContent);
+            const textModel = reference.object.textEditorModel;
+            const editOperations: monaco.editor.IIdentifiedSingleEditOperation[] = [];
+            if (path.length || value !== undefined) {
+                const { insertSpaces, tabSize, defaultEOL } = textModel.getOptions();
+                for (const edit of jsoncparser.modify(content, path, value, {
+                    formattingOptions: {
+                        insertSpaces,
+                        tabSize,
+                        eol: defaultEOL === monaco.editor.DefaultEndOfLine.LF ? '\n' : '\r\n'
+                    }
+                })) {
+                    const start = textModel.getPositionAt(edit.offset);
+                    const end = textModel.getPositionAt(edit.offset + edit.length);
+                    editOperations.push({
+                        range: monaco.Range.fromPositions(start, end),
+                        text: edit.content || null,
+                        forceMoveMarkers: false
+                    });
+                }
+            } else {
+                editOperations.push({
+                    range: textModel.getFullModelRange(),
+                    text: null,
+                    forceMoveMarkers: false
+                });
+            }
+            await this.workspace.applyBackgroundEdit(reference.object, editOperations);
+            return true;
         } catch (e) {
-            const message = `Failed to update the value of ${key}.`;
-            this.messageService.error(`${message} Please check if ${resource.uri.toString()} is corrupted.`);
-            console.error(`${message} ${e.toString()}`);
+            const message = `Failed to update the value of '${key}' in '${this.getUri()}'.`;
+            this.messageService.error(`${message} Please check if it is corrupted.`);
+            console.error(`${message}`, e);
             return false;
         }
-        await this.readPreferences();
-        return true;
     }
 
     protected getPath(preferenceName: string): string[] | undefined {
         return [preferenceName];
     }
 
-    protected loaded = false;
     protected async readPreferences(): Promise<void> {
-        const newContent = await this.readContents();
-        this.loaded = newContent !== undefined;
-        const newPrefs = newContent ? this.getParsedContent(newContent) : {};
-        this.handlePreferenceChanges(newPrefs);
+        try {
+            const reference = await this.reference;
+            const newContent = reference.object.getText();
+            this.loadPreferences(newContent);
+        } catch (e) {
+            console.error(`Failed to load preferences from '${this.getUri()}'.`, e);
+        }
     }
 
-    protected async readContents(): Promise<string | undefined> {
-        try {
-            const resource = await this.resource;
-            return await resource.readContents();
-        } catch {
-            return undefined;
-        }
+    protected loaded = false;
+    protected loadPreferences(content: string | undefined): void {
+        this.loaded = content !== undefined;
+        const newPrefs = content ? this.getParsedContent(content) : {};
+        this.handlePreferenceChanges(newPrefs);
     }
 
     protected getParsedContent(content: string): { [key: string]: any } {
@@ -222,30 +264,5 @@ export abstract class AbstractResourcePreferenceProvider extends PreferenceProvi
         }
     }
 
-    /**
-     * Get the formatting options to be used when calling `jsoncparser`.
-     * The formatting options are based on the corresponding preference values.
-     *
-     * The formatting options should attempt to obtain the preference values from JSONC,
-     * and if necessary fallback to JSON and the global values.
-     * @param uri the preference settings URI.
-     *
-     * @returns a tuple representing the tab indentation size, and if it is spaces.
-     */
-    protected getFormattingOptions(uri?: string): jsoncparser.FormattingOptions {
-        // Get the global formatting options for both `tabSize` and `insertSpaces`.
-        const globalTabSize = this.preferenceService.get('editor.tabSize', 2, uri);
-        const globalInsertSpaces = this.preferenceService.get('editor.insertSpaces', true, uri);
-
-        // Get the superset JSON formatting options for both `tabSize` and `insertSpaces`.
-        const jsonTabSize = this.preferenceService.get('[json].editor.tabSize', globalTabSize, uri);
-        const jsonInsertSpaces = this.preferenceService.get('[json].editor.insertSpaces', globalInsertSpaces, uri);
-
-        return {
-            tabSize: this.preferenceService.get('[jsonc].editor.tabSize', jsonTabSize, uri),
-            insertSpaces: this.preferenceService.get('[jsonc].editor.insertSpaces', jsonInsertSpaces, uri),
-            eol: ''
-        };
-    }
-
 }
+
