@@ -150,19 +150,19 @@ export namespace CommonCommands {
         label: 'Close All Tabs'
     };
     export const CLOSE_EDITOR: Command = {
-        id: 'core.close.editor',
+        id: 'core.close.main.tabs',
         category: VIEW_CATEGORY,
-        label: 'Close Editor'
+        label: 'Close Tab in Main Area'
     };
     export const CLOSE_OTHER_EDITORS: Command = {
-        id: 'core.close.other.editors',
+        id: 'core.close.other.main.tabs',
         category: VIEW_CATEGORY,
-        label: 'Close Other Editors'
+        label: 'Close Other Tabs in Main Area'
     };
     export const CLOSE_ALL_EDITORS: Command = {
-        id: 'core.close.all.editors',
+        id: 'core.close.all.main.tabs',
         category: VIEW_CATEGORY,
-        label: 'Close All Editors'
+        label: 'Close All Tabs in Main Area'
     };
     export const COLLAPSE_PANEL: Command = {
         id: 'core.collapse.tab',
@@ -384,7 +384,8 @@ export class CommonFrontendContribution implements FrontendApplicationContributi
         });
 
         registry.registerMenuAction(CommonMenus.FILE_CLOSE, {
-            commandId: CommonCommands.CLOSE_EDITOR.id
+            commandId: CommonCommands.CLOSE_EDITOR.id,
+            label: 'Close Editor'
         });
 
         registry.registerSubmenu(CommonMenus.FILE_SETTINGS_SUBMENU, 'Settings');
